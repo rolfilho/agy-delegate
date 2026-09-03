@@ -1,0 +1,6 @@
+# Private working log: records lessons against real client work. Never publish.
+AGY-LOG.md
+
+__pycache__/
+*.pyc
+.DS_Store

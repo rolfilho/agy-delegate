@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""Canonical entry point for delegating mechanical work to agy (Antigravity CLI).
+
+Wraps the manual recipe in AGY.md and the failures behind it:
+master switch, flag order, prompt injections, model
+validation, failure classification (quota vs capacity vs network vs auth),
+silent-partial detection, protected-path enforcement, expected-output
+assertions, and a run record for later analysis.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+# Honours CLAUDE_CONFIG_DIR so the state files sit beside the rest of your
+# Claude Code config wherever that lives.
+CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (HOME / ".claude"))
+ENABLE_FLAG = CONFIG_DIR / "agy-enabled"
+QUOTA_BLOCK = CONFIG_DIR / "agy-quota-block"
+RUN_LOG = CONFIG_DIR / "agy-runs.jsonl"
+MODEL_CACHE = CONFIG_DIR / "agy-models.cache"
+MODEL_CACHE_TTL = 24 * 3600
+
+ANTI_SCRIPT_PARAGRAPH = (
+    "Write each file directly with your file-writing tool. Do not write a Python "
+    "script, a shell script or any other program to generate them, and do not run "
+    "any command. This environment denies command execution without a prompt, so "
+    "a script you write but cannot run produces nothing and the whole batch is lost."
+)
+
+SCOPE_PARAGRAPH = (
+    "Write only the files the plan names as outputs. Do not edit, tidy, reformat or "
+    "update the status of any other file, including task boards, state files, READMEs "
+    "and memory files, even if doing so looks helpful or consistent with your work."
+)
+
+EVIDENCE_PARAGRAPH = (
+    "Cite evidence as a literal quote copied verbatim from the source. Never cite a "
+    "file:line reference such as `file.md:44-47` — line numbers you report are "
+    "wrong and cannot be checked; cite the file by name and quote the text instead. "
+    "If a question has no defensible answer in the sources, say so explicitly in the "
+    "answer field rather than choosing the closest option."
+)
+
+DEFAULT_MODEL = "Gemini 3.6 Flash (High)"
+DEFAULT_MODE = "accept-edits"
+DEFAULT_TIMEOUT = "30m"
+DEFAULT_BATCH_SIZE = 6
+SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
+    ".pytest_cache", "dist", "build", ".next", ".cache",
+}
+SCRIPT_SUFFIXES = (".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".ts", ".rb", ".pl")
+DEFAULT_PROTECTED = ["03_State/*", "MEMORY.md", "AGENTS.md", "CLAUDE.md", ".claude/*"]
+
+# Failure classes read off agy's own output and CLI log.
+QUOTA_RE = re.compile(r"RESOURCE_EXHAUSTED|code 429|Individual quota reached", re.I)
+RESET_RE = re.compile(r"Resets in ([0-9hms]+)")
+CAPACITY_RE = re.compile(r"MODEL_CAPACITY_EXHAUSTED|No capacity available for model|code 503", re.I)
+NETWORK_RE = re.compile(r"dial tcp: lookup \S+: no such host|connection refused", re.I)
+AUTH_RE = re.compile(r"not logged into Antigravity", re.I)
+AUTH_OK_RE = re.compile(r"silent auth succeeded", re.I)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def write_state(path, text):
+    """State writes are best-effort: never fail a run over a cache file."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    except OSError as exc:
+        log(f"WARNING: could not write {path}: {exc}")
+
+
+def check_enabled():
+    if not ENABLE_FLAG.exists():
+        sys.exit(
+            f"agy delegation is OFF ({ENABLE_FLAG} absent). "
+            f"Enable with: touch {ENABLE_FLAG}"
+        )
+
+
+def check_quota_block(force):
+    """Refuse to start while a previously observed quota window is still open."""
+    if not QUOTA_BLOCK.exists():
+        return
+    try:
+        until = float(QUOTA_BLOCK.read_text().strip())
+    except (ValueError, OSError):
+        QUOTA_BLOCK.unlink(missing_ok=True)
+        return
+    remaining = until - time.time()
+    if remaining <= 0:
+        QUOTA_BLOCK.unlink(missing_ok=True)
+        return
+    msg = (
+        f"agy quota was exhausted; it resets in {int(remaining // 60)}m "
+        f"(at {datetime.fromtimestamp(until).strftime('%H:%M')}). "
+        "Every run started before then fails without producing anything. "
+        "Do the work directly, or wait. Override with --ignore-quota-block."
+    )
+    if force:
+        log(f"WARNING: {msg}")
+    else:
+        sys.exit(msg)
+
+
+def set_quota_block(reset_text):
+    seconds = 0
+    if reset_text:
+        for value, unit in re.findall(r"(\d+)([hms])", reset_text):
+            seconds += int(value) * {"h": 3600, "m": 60, "s": 1}[unit]
+    seconds = seconds or 3600
+    write_state(QUOTA_BLOCK, str(time.time() + seconds))
+
+
+def available_models():
+    """(ids, labels) from `agy models`, cached for a day. Empty on failure."""
+    text = None
+    try:
+        if MODEL_CACHE.exists() and time.time() - MODEL_CACHE.stat().st_mtime < MODEL_CACHE_TTL:
+            text = MODEL_CACHE.read_text()
+    except OSError:
+        text = None
+    if text is None:
+        try:
+            result = subprocess.run(
+                ["agy", "models"], capture_output=True, text=True, timeout=120
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return set(), set()
+        if result.returncode != 0:
+            return set(), set()
+        text = result.stdout
+        write_state(MODEL_CACHE, text)
+    ids, labels = set(), set()
+    for line in text.splitlines():
+        if "\t" in line:
+            model_id, _, label = line.partition("\t")
+            ids.add(model_id.strip())
+            labels.add(label.strip())
+    return ids, labels
+
+
+def check_model(model):
+    """A label agy does not know is accepted silently and falls back. Fail first."""
+    ids, labels = available_models()
+    if not ids and not labels:
+        log("WARNING: could not list models (`agy models` failed); skipping validation.")
+        return
+    if model in ids or model in labels:
+        return
+    listing = "\n".join(sorted(f"  {i}" for i in labels))
+    sys.exit(
+        f"Model {model!r} is not one agy offers. It would be accepted and silently "
+        f"replaced by a default. Available:\n{listing}"
+    )
+
+
+def check_git_repo(add_dir):
+    result = subprocess.run(
+        ["git", "-C", add_dir, "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(
+            f"WARNING: {add_dir} is not a git repo. No diff/reset safety net for agy's edits.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def walk_files(add_dir):
+    for dirpath, dirnames, filenames in os.walk(add_dir):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            yield Path(dirpath) / name
+
+
+def snapshot(add_dir):
+    files = {}
+    for p in walk_files(add_dir):
+        try:
+            files[str(p)] = p.stat().st_mtime
+        except OSError:
+            pass
+    return files
+
+
+def diff_snapshot(before, after):
+    created = sorted(set(after) - set(before))
+    modified = sorted(p for p in (after.keys() & before.keys()) if after[p] != before[p])
+    return created, modified
+
+
+def stray_scripts(created):
+    return [p for p in created if p.endswith(SCRIPT_SUFFIXES)]
+
+
+PROSE_SUFFIXES = (".md", ".txt")
+_WORD_RE = re.compile(r"[^\w\s]")
+
+
+def _paragraphs(text):
+    """Prose paragraphs only: drop headings, list items and short lines, since
+    those are where the plan's own mandated template text legitimately repeats.
+    """
+    for block in re.split(r"\n\s*\n", text):
+        block = block.strip()
+        if not block or block.startswith(("#", "-", "*", "|", ">")):
+            continue
+        words = block.split()
+        if len(words) < 12:
+            continue
+        yield block
+
+
+def _opening_clause(paragraph, n=8):
+    words = _WORD_RE.sub("", paragraph.lower()).split()
+    return " ".join(words[:n])
+
+
+def detect_template_collapse(created, min_files=3, min_share=0.4):
+    """Cheap post-run signal: a multi-file run can be structurally perfect and
+    still return the same generic skeleton for a judgment section. Compares
+    prose-paragraph opening clauses across files, ignoring headings and
+    short/list lines so the plan's own mandated template text (which SHOULD
+    repeat) does not trigger a false alarm. Not proof — a name for what the
+    caller currently only finds by reading every file.
+    """
+    prose_files = [p for p in created if p.endswith(PROSE_SUFFIXES)]
+    if len(prose_files) < min_files:
+        return []
+    openings = {}  # clause -> set of files
+    for p in prose_files:
+        try:
+            text = Path(p).read_text(errors="ignore")
+        except OSError:
+            continue
+        seen_in_file = set()
+        for para in _paragraphs(text):
+            clause = _opening_clause(para)
+            if len(clause.split()) < 5 or clause in seen_in_file:
+                continue
+            seen_in_file.add(clause)
+            openings.setdefault(clause, set()).add(p)
+    threshold = max(min_files, int(len(prose_files) * min_share))
+    hits = [
+        (clause, sorted(files))
+        for clause, files in openings.items()
+        if len(files) >= threshold
+    ]
+    hits.sort(key=lambda h: -len(h[1]))
+    return hits
+
+
+def protected_hits(paths, add_dir, patterns):
+    hits = []
+    for p in paths:
+        try:
+            rel = str(Path(p).relative_to(add_dir))
+        except ValueError:
+            rel = p
+        for pattern in patterns:
+            if Path(rel).match(pattern) or rel.startswith(pattern.rstrip("*")):
+                hits.append(p)
+                break
+    return hits
+
+
+def build_prompt(plan_file, args, extra_note=None):
+    parts = [
+        f"Execute the plan in {plan_file} exactly as written. "
+        "Report every file you changed."
+    ]
+    if extra_note:
+        parts.append(extra_note)
+    parts.append(SCOPE_PARAGRAPH)
+    if not args.no_evidence_rules:
+        parts.append(EVIDENCE_PARAGRAPH)
+    parts.append(ANTI_SCRIPT_PARAGRAPH)
+    return "\n\n".join(parts)
+
+
+def build_command(args, prompt):
+    cmd = [
+        "agy",
+        "--model", args.model,
+        "--mode", args.mode,
+        "--print-timeout", args.print_timeout,
+        "--add-dir", args.add_dir,
+    ]
+    if args.dangerously_skip_permissions:
+        cmd.append("--dangerously-skip-permissions")
+    cmd += ["-p", prompt]
+    return cmd
+
+
+def classify(output):
+    if QUOTA_RE.search(output):
+        return "quota"
+    if CAPACITY_RE.search(output):
+        return "capacity"
+    if NETWORK_RE.search(output):
+        return "network"
+    if AUTH_RE.search(output) and not AUTH_OK_RE.search(output):
+        return "auth"
+    return "unknown"
+
+
+def tail_cli_log():
+    """agy writes the useful diagnosis to its own log, not to stdout."""
+    logs = sorted(
+        glob.glob(str(HOME / ".gemini" / "antigravity-cli" / "log" / "cli-*.log")),
+        key=os.path.getmtime,
+    )
+    if not logs:
+        return ""
+    try:
+        return Path(logs[-1]).read_text(errors="ignore")[-40000:]
+    except OSError:
+        return ""
+
+
+def run_agy(args, prompt, env):
+    """Run agy once, echoing output while capturing it. Returns (rc, output)."""
+    cmd = build_command(args, prompt)
+    if args.dry_run:
+        log("DRY RUN, would execute:")
+        log(" ".join(shlex.quote(c) for c in cmd))
+        return 0, ""
+    started = time.time()
+    process = subprocess.Popen(
+        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    chunks = []
+    for line in process.stdout:
+        chunks.append(line)
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    rc = process.wait()
+    log(f"[agy exit {rc} after {int(time.time() - started)}s]")
+    return rc, "".join(chunks)
+
+
+def attempt(args, prompt, env, label):
+    """Run with retries, classifying failures instead of retrying blindly.
+
+    Returns (rc, reason); reason is None on success, else a failure class.
+    """
+    reason = None
+    rc = 0
+    for i in range(args.retries + 1):
+        rc, output = run_agy(args, prompt, env)
+        if rc == 0:
+            return 0, None
+        reason = classify(output + "\n" + tail_cli_log())
+        if reason == "quota":
+            match = RESET_RE.search(output) or RESET_RE.search(tail_cli_log())
+            reset_text = match.group(1) if match else ""
+            set_quota_block(reset_text)
+            log(
+                f"{label}: quota exhausted"
+                + (f", resets in {reset_text}" if reset_text else "")
+                + ". Not retrying — every further run fails identically until reset."
+            )
+            return rc, "quota"
+        if reason == "network":
+            log(f"{label}: no network route to the model backend. Not retrying.")
+            return rc, "network"
+        if reason == "auth":
+            log(f"{label}: not authenticated. Run `agy` once interactively to log in.")
+            return rc, "auth"
+        if i < args.retries:
+            delay = 30 if reason == "capacity" else 5
+            log(f"{label}: failed (exit {rc}, {reason}); retrying in {delay}s...")
+            time.sleep(delay)
+    return rc, reason
+
+
+def record_run(entry):
+    try:
+        RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with RUN_LOG.open("a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
+def chunk(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="agy-delegate",
+        description="Canonical wrapper for delegating mechanical work to agy.",
+    )
+    parser.add_argument("plan_file", help="Path to the plan file (e.g. PLAN.md) agy should execute.")
+    parser.add_argument("--add-dir", required=True, help="Directory to scope agy's workspace to.")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--mode", default=DEFAULT_MODE)
+    parser.add_argument("--print-timeout", default=DEFAULT_TIMEOUT)
+    parser.add_argument("--dangerously-skip-permissions", action="store_true")
+    parser.add_argument("--batch-inputs", help="Glob of input files to split into batches; one agy run per batch.")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--retries", type=int, default=1)
+    parser.add_argument("--expect-created", type=int, help="Number of files the plan says this run creates.")
+    parser.add_argument("--expect-modified", type=int, help="Number of existing files the plan says this run modifies.")
+    parser.add_argument("--protect", action="append", default=None,
+                        help="Glob (relative to --add-dir) agy must not touch. Repeatable. "
+                             f"Default: {' '.join(DEFAULT_PROTECTED)}")
+    parser.add_argument("--uncertainty-token", help="Token the plan invites for 'no defensible answer'; "
+                                                    "its absence from every output is reported, not trusted.")
+    parser.add_argument("--no-evidence-rules", action="store_true",
+                        help="Do not inject the quote-not-line-number and uncertainty paragraph.")
+    parser.add_argument("--ignore-quota-block", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    if not (4 <= args.batch_size <= 9):
+        sys.exit("--batch-size must be between 4 and 9 (silent partials hide in larger batches).")
+
+    check_enabled()
+    check_quota_block(args.ignore_quota_block)
+    add_dir = str(Path(args.add_dir).resolve())
+    args.add_dir = add_dir
+    is_git = check_git_repo(add_dir)
+
+    if not os.path.isfile(args.plan_file):
+        sys.exit(f"Plan file not found: {args.plan_file}")
+
+    check_model(args.model)
+
+    protected = args.protect if args.protect is not None else DEFAULT_PROTECTED
+    env = os.environ.copy()
+
+    before = snapshot(add_dir) if not args.dry_run else {}
+    started = time.time()
+    failures = []
+    aborted = None
+
+    if args.batch_inputs:
+        items = sorted(glob.glob(args.batch_inputs))
+        if not items:
+            sys.exit(f"No files matched --batch-inputs {args.batch_inputs}")
+        batch_list = list(chunk(items, args.batch_size))
+        log(f"{len(items)} inputs split into {len(batch_list)} batches of up to {args.batch_size}.")
+        for i, batch in enumerate(batch_list, 1):
+            note = "Process only these inputs in this run:\n" + "\n".join(batch)
+            prompt = build_prompt(args.plan_file, args, note)
+            label = f"batch {i}/{len(batch_list)}"
+            log(f"--- {label} ({len(batch)} files) ---")
+            batch_before = snapshot(add_dir) if not args.dry_run else {}
+            rc, reason = attempt(args, prompt, env, label)
+            if reason in ("quota", "network", "auth"):
+                aborted = reason
+                failures.append(i)
+                log(f"Aborting remaining batches: {reason}.")
+                break
+            if rc != 0:
+                failures.append(i)
+                continue
+            if args.dry_run:
+                continue
+            # Exit 0 having written nothing is the documented silent partial.
+            created_now, modified_now = diff_snapshot(batch_before, snapshot(add_dir))
+            if not created_now and not modified_now:
+                log(f"{label}: exit 0 but wrote nothing — treating as failed, retrying.")
+                attempt(args, prompt, env, f"{label} (silent partial)")
+                created_now, modified_now = diff_snapshot(batch_before, snapshot(add_dir))
+                if not created_now and not modified_now:
+                    failures.append(i)
+                    log(f"{label}: still wrote nothing. Its inputs were NOT processed.")
+        if failures:
+            print(f"Batches that failed or produced nothing: {sorted(set(failures))}", file=sys.stderr)
+    else:
+        prompt = build_prompt(args.plan_file, args)
+        rc, reason = attempt(args, prompt, env, "run")
+        if rc != 0:
+            failures.append(1)
+            aborted = reason if reason in ("quota", "network", "auth") else None
+
+    if args.dry_run:
+        return
+
+    after = snapshot(add_dir)
+    created, modified = diff_snapshot(before, after)
+    strays = stray_scripts(created)
+    touched_protected = protected_hits(created + modified, add_dir, protected)
+
+    problems = []
+    log("\n--- coverage summary ---")
+    log(f"Files created: {len(created)}")
+    for p in created:
+        log(f"  + {p}")
+    log(f"Files modified: {len(modified)}")
+    for p in modified:
+        log(f"  ~ {p}")
+
+    if not created and not modified:
+        problems.append("the run wrote nothing at all")
+    if args.expect_created is not None and len(created) != args.expect_created:
+        problems.append(f"plan declared {args.expect_created} created, got {len(created)}")
+    if args.expect_modified is not None and len(modified) != args.expect_modified:
+        problems.append(f"plan declared {args.expect_modified} modified, got {len(modified)}")
+
+    if strays:
+        problems.append(
+            f"{len(strays)} new script file(s) — agy may have written a generator instead of the answer"
+        )
+        for p in strays:
+            log(f"  ! script: {p}")
+
+    if touched_protected:
+        problems.append(f"{len(touched_protected)} protected path(s) touched")
+        log("\nPROTECTED PATHS TOUCHED — agy edited files the plan did not name:")
+        for p in touched_protected:
+            log(f"  !! {p}")
+        if is_git:
+            rels = " ".join(shlex.quote(os.path.relpath(p, add_dir)) for p in touched_protected)
+            log(f"  revert with: git -C {shlex.quote(add_dir)} checkout -- {rels}")
+
+    if args.uncertainty_token and created:
+        hits = 0
+        for p in created:
+            try:
+                hits += Path(p).read_text(errors="ignore").count(args.uncertainty_token)
+            except OSError:
+                pass
+        if hits == 0:
+            log(
+                f"\nCALIBRATION: {args.uncertainty_token!r} appears zero times across the output. "
+                "agy does not emit uncertainty even where it should. Read that as an open question, "
+                "never as confidence — check the hardest input by hand."
+            )
+
+    line_cites = []
+    for p in created:
+        try:
+            if re.search(r"\.(md|txt|csv|ya?ml|json|py|sql)\s*:\s*\d+", Path(p).read_text(errors="ignore")):
+                line_cites.append(p)
+        except OSError:
+            pass
+    if line_cites:
+        log("\nWARNING: file:line citations found. Line numbers agy reports are unreliable; "
+            "verify by grepping the quote instead:")
+        for p in line_cites:
+            log(f"  ? {p}")
+
+    collapse_hits = detect_template_collapse(created)
+    if collapse_hits:
+        log(
+            "\nCALIBRATION: possible template collapse — the same prose paragraph opening "
+            "repeats across multiple output files. Structural correctness does not imply "
+            "substantive content; read the flagged section by hand in a few files before "
+            "trusting it:"
+        )
+        for clause, files in collapse_hits[:5]:
+            log(f"  ~ \"{clause}...\" in {len(files)}/{len(created)} files")
+            for p in files[:3]:
+                log(f"      {p}")
+            if len(files) > 3:
+                log(f"      ... and {len(files) - 3} more")
+
+    record_run({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plan": args.plan_file,
+        "add_dir": add_dir,
+        "model": args.model,
+        "batched": bool(args.batch_inputs),
+        "seconds": int(time.time() - started),
+        "created": len(created),
+        "modified": len(modified),
+        "failed_batches": sorted(set(failures)),
+        "aborted": aborted,
+        "problems": problems,
+    })
+
+    if problems or failures:
+        log("\n--- NOT CLEAN ---")
+        for p in problems:
+            log(f"  * {p}")
+        if failures:
+            log(f"  * failed or empty batches: {sorted(set(failures))}")
+        if aborted:
+            log(f"  * aborted early: {aborted}")
+        sys.exit(1)
+
+    log(
+        "\nThis summary is not proof of correctness. Verify created/modified files "
+        "against the source before they reach anything client-facing."
+    )
+
+
+if __name__ == "__main__":
+    main()
